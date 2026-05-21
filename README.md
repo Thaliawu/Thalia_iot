@@ -5,7 +5,7 @@
 ## ✅ 运行状态
 代码运行稳定，串口持续输出温湿度数据：
 
-![串口运行截图](images/ESP32-output.png)
+![ESP32输出图](images/ESP32-output.png)
 
 ## 🛠️ 核心技术栈
 *   **主控芯片**：ESP32
