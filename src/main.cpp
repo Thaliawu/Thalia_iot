@@ -1,187 +1,246 @@
 #include <Arduino.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
-#include <freertos/queue.h>
-#include <DHT.h>   // 使用你刚安装的 Adafruit 库
-#include <DHT_U.h> // Adafruit 统一传感器接口
-#include <EEPROM.h>
+#include <WiFi.h>
+#include "DHT.h"
 
-// CRC16 校验函数 (Modbus 标准)
-uint16_t calculateCRC16(uint8_t *data, uint16_t length)
+// ========== DHT11 配置 ==========
+#define DHTPIN 4
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// ========== WiFi 配置 ==========
+const char *ssid = "Thalia";        // 改成你的 WiFi 名
+const char *password = "ssjw12138"; // 改成你的 WiFi 密码
+
+// ========== Modbus TCP 配置 ==========
+WiFiServer modbusServer(502); // Modbus TCP 默认端口 502
+WiFiClient client;            // 当前连接的客户端
+
+// 保持寄存器区（Holding Registers）
+// 地址 0: 温度值（放大10倍，如 25.6℃ -> 256）
+// 地址 1: 湿度值（放大10倍，如 68.0% -> 680）
+uint16_t holdingRegisters[2] = {0, 0};
+
+// ========== 更新传感器数据到寄存器 ==========
+void updateSensorData()
 {
-    uint16_t crc = 0xFFFF;
-    for (uint16_t i = 0; i < length; i++)
+    float temp = dht.readTemperature();
+    float hum = dht.readHumidity();
+
+    if (!isnan(temp) && !isnan(hum))
     {
-        crc ^= data[i];
-        for (uint8_t j = 0; j < 8; j++)
-        {
-            if ((crc & 0x0001) != 0)
-            {
-                crc >>= 1;
-                crc ^= 0xA001;
-            }
-            else
-            {
-                crc >>= 1;
-            }
-        }
+        holdingRegisters[0] = (uint16_t)(temp * 10); // 温度 *10
+        holdingRegisters[1] = (uint16_t)(hum * 10);  // 湿度 *10
+
+        Serial.print("温度: ");
+        Serial.print(temp);
+        Serial.print("℃ -> 寄存器0 = ");
+        Serial.print(holdingRegisters[0]);
+        Serial.print("  湿度: ");
+        Serial.print(hum);
+        Serial.print("% -> 寄存器1 = ");
+        Serial.println(holdingRegisters[1]);
     }
-    return crc;
-}
-
-// =========================
-// 1. 引脚与对象定义
-// =========================
-#define DHT_PIN 4
-#define DHT_TYPE DHT11 // 明确指定是 DHT11
-#define EEPROM_SIZE 64
-
-DHT dht(DHT_PIN, DHT_TYPE); // 创建 DHT 传感器对象
-
-// 模拟 Modbus 保持寄存器 (Holding Registers)
-// 地址 0: 温度 (x10), 地址 1: 湿度 (x10)
-volatile uint16_t modbus_regs[2] = {0, 0};
-
-QueueHandle_t sensor_queue;
-
-// ✅ 新增：用于 EEPROM 定时保存的时间戳
-static uint32_t lastSaveTime = 0;
-// =========================
-// 2. 采样任务（高优先级）
-// =========================
-void sampling_task(void *pv)
-{
-    dht.begin(); // 初始化传感器
-
-    float temp, humi;
-
-    while (1)
+    else
     {
-        temp = dht.readTemperature(); // 读取温度
-        humi = dht.readHumidity();    // 读取湿度
-
-        // 检查读数是否合法
-        if (!isnan(temp) && !isnan(humi))
-        {
-            // 把数据放入队列
-            float data[2] = {temp, humi};
-            xQueueSend(sensor_queue, data, portMAX_DELAY);
-        }
-        vTaskDelay(pdMS_TO_TICKS(2000)); // 2秒采集一次
+        Serial.println("DHT11 读取失败，寄存器保持不变");
     }
 }
 
-// =========================
-// 3. 通信任务（低优先级）
-// =========================
-void comm_task(void *pv)
+// ========== 发送 Modbus 响应报文（带调试打印）==========
+void sendModbusResponse(uint8_t *response, int len)
 {
-    float data[2];
+    Serial.print("准备发送响应，长度: ");
+    Serial.println(len);
 
-    while (1)
+    if (client.connected())
     {
-        if (xQueueReceive(sensor_queue, data, portMAX_DELAY))
+        int sent = client.write(response, len);
+        client.flush();
+        Serial.print("实际发送字节数: ");
+        Serial.println(sent);
+
+        // 可选：打印发送的前几个字节（十六进制）
+        Serial.print("响应报文前8字节: ");
+        for (int i = 0; i < (len > 8 ? 8 : len); i++)
         {
-            // 简历亮点：将数据写入 Modbus 寄存器
-            // 工业标准：浮点数转整数（放大10倍，保留一位小数）
-            // 简历亮点：将数据写入 Modbus 寄存器
-            // 工业标准：浮点数转整数（放大10倍，保留一位小数）
-            modbus_regs[0] = (uint16_t)(data[0] * 10); // 温度
-            modbus_regs[1] = (uint16_t)(data[1] * 10); // 湿度
-
-            Serial.print("Modbus Regs -> Temp: ");
-            Serial.print(modbus_regs[0]);
-            Serial.print(", Humi: ");
-            Serial.println(modbus_regs[1]);
-
-            // ============================================================
-            // ✅ 这里开始：插入你刚才准备好的 CRC 校验代码块
-            // ============================================================
-            // 1. 准备发送的数据包
-            uint8_t response[6]; // ⚠️ 注意：这里要改成 6，因为有4个数据位+2个CRC位
-            response[0] = highByte(modbus_regs[0]);
-            response[1] = lowByte(modbus_regs[0]);
-            response[2] = highByte(modbus_regs[1]);
-            response[3] = lowByte(modbus_regs[1]);
-
-            // 2. 计算 CRC
-            uint16_t crc = calculateCRC16(response, 4);
-
-            // 3. 把 CRC 追加到数据包后面
-            response[4] = lowByte(crc);  // CRC 低字节
-            response[5] = highByte(crc); // CRC 高字节
-
-            // 4. 发送出去
-            Serial.write(response, 6);
-            // ============================================================
-            // ✅ 这里结束：CRC 校验代码块
-            // ============================================================
-
-            // ✅ 新增：用于 EEPROM 定时保存的时间戳
-            // 检查读数是否合法 (其实这里主要是定时器逻辑)
-            // 注意：原来的代码里这里有个 if (!isnan...) 判断，但在 comm_task 里 data 已经是 float 了
-            // 我们直接保留你的 EEPROM 逻辑，但把它放在 CRC 发送之后
-
-            // 每 30 秒保存一次
-            if (millis() - lastSaveTime > 30000)
-            {
-                EEPROM.write(0, modbus_regs[0]);
-                EEPROM.write(1, modbus_regs[1]);
-                EEPROM.commit();
-                Serial.println("EEPROM Saved.");
-                lastSaveTime = millis();
-            }
-
-            // ✅ EEPROM 定时保存（每 30 秒写一次）
+            Serial.print(response[i], HEX);
+            Serial.print(" ");
         }
+        Serial.println();
+    }
+    else
+    {
+        Serial.println("错误: client 已断开连接，无法发送响应");
     }
 }
 
-// =========================
-// 4. 初始化
-// =========================
-// =========================
-// 4. 初始化
-// =========================
+// ========== 处理 Modbus TCP 请求（只实现功能码 0x03）==========
+void handleModbusRequest(uint8_t *request, int len)
+{
+    // 调试打印：收到请求
+    Serial.print("收到 Modbus 请求，长度: ");
+    Serial.println(len);
+
+    // Modbus TCP 报文最小长度：MBAP(7) + PDU(2) = 9 字节
+    if (len < 9)
+        return;
+
+    // 提取 MBAP 头
+    uint16_t transactionId = (request[0] << 8) | request[1];
+    uint16_t protocolId = (request[2] << 8) | request[3];
+    uint16_t length = (request[4] << 8) | request[5]; // 后续字节数
+    uint8_t unitId = request[6];
+
+    // 只支持 Modbus 协议 (protocolId = 0)
+    if (protocolId != 0)
+        return;
+
+    // 提取 PDU
+    uint8_t functionCode = request[7];
+
+    // 目前只实现功能码 03：读保持寄存器
+    if (functionCode == 0x03)
+    {
+        // 需要至少还有 4 个字节：起始地址(2) + 寄存器数量(2)
+        if (len < 11)
+            return;
+
+        uint16_t startAddr = (request[8] << 8) | request[9];
+        uint16_t quantity = (request[10] << 8) | request[11];
+
+        // 检查数量范围（Modbus 最大允许 125 个寄存器，这里限制为 2）
+        if (quantity < 1 || quantity > 2)
+        {
+            // 返回异常响应：非法数据值 (异常码 0x03)
+            uint8_t exceptionRsp[9] = {
+                (uint8_t)(transactionId >> 8), (uint8_t)(transactionId & 0xFF),
+                (uint8_t)(protocolId >> 8), (uint8_t)(protocolId & 0xFF),
+                0x00, 0x03, // 长度 = 3（unitId + functionCode + exceptionCode）
+                unitId,
+                (uint8_t)(functionCode | 0x80), // 功能码 + 0x80
+                0x03                            // 异常码：非法数据值
+            };
+            Serial.println("返回异常: 非法数据值 (0x03)");
+            sendModbusResponse(exceptionRsp, 9);
+            return;
+        }
+
+        // 检查地址范围（我们只支持地址 0 和 1）
+        if (startAddr + quantity > 2)
+        {
+            // 返回异常响应：非法数据地址 (异常码 0x02)
+            uint8_t exceptionRsp[9] = {
+                (uint8_t)(transactionId >> 8), (uint8_t)(transactionId & 0xFF),
+                (uint8_t)(protocolId >> 8), (uint8_t)(protocolId & 0xFF),
+                0x00, 0x03,
+                unitId,
+                (uint8_t)(functionCode | 0x80),
+                0x02};
+            Serial.println("返回异常: 非法数据地址 (0x02)");
+            sendModbusResponse(exceptionRsp, 9);
+            return;
+        }
+
+        // 构建正常响应
+        int byteCount = quantity * 2;    // 每个寄存器 2 字节
+        uint8_t response[9 + byteCount]; // MBAP(7) + PDU(2 + byteCount)
+
+        // MBAP 头
+        response[0] = transactionId >> 8;
+        response[1] = transactionId & 0xFF;
+        response[2] = protocolId >> 8;
+        response[3] = protocolId & 0xFF;
+        response[4] = (uint8_t)((byteCount + 3) >> 8); // 长度 = unitId(1) + functionCode(1) + byteCount
+        response[5] = (uint8_t)((byteCount + 3) & 0xFF);
+        response[6] = unitId;
+
+        // PDU: 功能码 + 字节数 + 寄存器数据
+        response[7] = functionCode; // 0x03
+        response[8] = byteCount;    // 后续字节数
+
+        // 填入寄存器值（大端序：高字节在前）
+        for (int i = 0; i < quantity; i++)
+        {
+            uint16_t regValue = holdingRegisters[startAddr + i];
+            response[9 + i * 2] = regValue >> 8;
+            response[9 + i * 2 + 1] = regValue & 0xFF;
+        }
+
+        Serial.println("构建正常响应，准备发送");
+        sendModbusResponse(response, 9 + byteCount);
+    }
+    else
+    {
+        // 不支持的功能码 -> 返回异常码 0x01（非法功能）
+        uint8_t exceptionRsp[9] = {
+            (uint8_t)(transactionId >> 8), (uint8_t)(transactionId & 0xFF),
+            (uint8_t)(protocolId >> 8), (uint8_t)(protocolId & 0xFF),
+            0x00, 0x03,
+            unitId,
+            (uint8_t)(functionCode | 0x80),
+            0x01};
+        Serial.println("返回异常: 非法功能 (0x01)");
+        sendModbusResponse(exceptionRsp, 9);
+    }
+}
+
+// ========== setup ==========
 void setup()
 {
     Serial.begin(115200);
-    delay(1000);
+    Serial.println("启动 ESP32 Modbus TCP 从站（原生实现）");
 
-    // 1. EEPROM 初始化
-    EEPROM.begin(EEPROM_SIZE);
+    dht.begin();
 
-    // 2. ✅ 先创建队列（必须先有碗，才能盛饭）
-    sensor_queue = xQueueCreate(5, sizeof(float) * 2);
+    // 连接 WiFi
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED)
+    {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nWiFi 连接成功");
+    Serial.print("ESP32 IP 地址: ");
+    Serial.println(WiFi.localIP());
 
-    // 3. 从 EEPROM 恢复数据
-    uint16_t saved_temp = EEPROM.read(0);
-    uint16_t saved_humi = EEPROM.read(1);
-
-    Serial.print("开机恢复 -> Temp: ");
-    Serial.print(saved_temp);
-    Serial.print(", Humi: ");
-    Serial.println(saved_humi);
-
-    // 4. 恢复寄存器
-    modbus_regs[0] = saved_temp;
-    modbus_regs[1] = saved_humi;
-
-    // 5. ✅ 把恢复的数据送入队列（队列已存在，安全）
-    // 注意：这里加上 (float) 或者 10.0f 是为了消除编译器的 narrowing warning
-    float restored_data[2] = {
-        (float)saved_temp / 10.0f,
-        (float)saved_humi / 10.0f};
-    xQueueSend(sensor_queue, restored_data, portMAX_DELAY);
-
-    // 6. 创建任务
-    xTaskCreate(sampling_task, "Sampling", 2048, NULL, 3, NULL);
-    xTaskCreate(comm_task, "Comm", 2048, NULL, 2, NULL);
-
-    vTaskDelete(NULL);
+    // 启动 Modbus TCP 服务器
+    modbusServer.begin();
+    Serial.println("Modbus TCP 服务器已启动，端口 502");
 }
 
+// ========== loop ==========
 void loop()
 {
-    // 留空，由 FreeRTOS 接管
+    // 1. 每 2 秒更新一次传感器数据并刷新寄存器
+    static unsigned long lastSensorRead = 0;
+    if (millis() - lastSensorRead >= 2000)
+    {
+        updateSensorData();
+        lastSensorRead = millis();
+    }
+
+    // 2. 检查是否有新的 Modbus 客户端连接
+    if (!client.connected())
+    {
+        client = modbusServer.available();
+        if (client.connected())
+        {
+            Serial.println("新 Modbus 客户端已连接");
+        }
+    }
+
+    // 3. 处理已连接客户端的请求
+    if (client.connected() && client.available())
+    {
+        // 读取 Modbus 请求报文（最多 256 字节）
+        uint8_t buffer[256];
+        int len = client.read(buffer, sizeof(buffer));
+        if (len > 0)
+        {
+            handleModbusRequest(buffer, len);
+        }
+    }
+
+    // 短暂延时避免 CPU 空转
+    delay(10);
 }
